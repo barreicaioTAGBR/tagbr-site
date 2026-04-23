@@ -529,7 +529,7 @@ input,select,button,textarea{font-family:var(--sans);font-size:14px;}
       </button>
 
       <div style="margin-top:14px;font-size:11px;color:var(--text3);font-family:var(--mono);">
-        já paguei? <a href="#" style="color:var(--acc);text-decoration:none;" onclick="goToSuccess();return false;">clique aqui</a>
+        já paguei? <a href="#" style="color:var(--acc);text-decoration:none;" onclick="jaPaguei();return false;">clique aqui</a>
       </div>
     </div>
   </div>
@@ -778,13 +778,37 @@ function openWhatsapp(){
   window.open(url, '_blank');
 }
 
-async function sendReceipt(){
+// Grava pending_payment no Firestore — usada TANTO pelo botão WhatsApp
+// quanto pelo link "já paguei". Sem isso, o pagamento some pro Caio.
+async function savePendingPaymentToFirestore(totalNum, source){
   var emailRaw = (document.getElementById('emailField').value || '').trim();
-  var email = emailRaw || '[não informado]';
-  var cupom = state.coupon ? state.coupon.code : 'nenhum';
-  var totalText = document.getElementById('sumTotal').textContent;
+  if(!(fbReady && fdb && emailRaw && state.plan && totalNum > 0)) return false;
+  try {
+    var payload = {
+      email: emailRaw.toLowerCase(),
+      plan: state.plan,                                    // 'monthly' | 'annual'
+      couponCode: state.coupon ? state.coupon.code : null,
+      couponDiscount: state.coupon ? state.coupon.value : null,
+      priceOriginal: state.price,
+      total: totalNum,
+      createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+      status: 'pending',
+      source: source || 'assinar-web'
+    };
+    var racePromise = Promise.race([
+      fdb.collection('pending_payments').add(payload),
+      new Promise(function(_, rej){ setTimeout(function(){ rej(new Error('timeout')); }, 4000); })
+    ]);
+    await racePromise;
+    return true;
+  } catch(e){
+    console.warn('[assinar] pending_payment falhou ('+(source||'')+'):', e);
+    return false;
+  }
+}
 
-  // Calcula total numérico (mesmo cálculo do updateSummary)
+// Calcula o total numérico aplicando desconto do cupom (usado nos 2 fluxos)
+function calcTotalNum(){
   var discount = 0;
   if(state.coupon){
     if(state.coupon.type === 'percent'){
@@ -793,7 +817,15 @@ async function sendReceipt(){
       discount = Math.min(state.coupon.value, state.price);
     }
   }
-  var totalNum = Math.max(0, state.price - discount);
+  return Math.max(0, state.price - discount);
+}
+
+async function sendReceipt(){
+  var emailRaw = (document.getElementById('emailField').value || '').trim();
+  var email = emailRaw || '[não informado]';
+  var cupom = state.coupon ? state.coupon.code : 'nenhum';
+  var totalText = document.getElementById('sumTotal').textContent;
+  var totalNum = calcTotalNum();
 
   // Monta mensagem do WhatsApp primeiro (pra não depender do Firestore)
   var msg = 'Oi Caio! Acabei de fazer o PIX pela página tagbr.app.br/assinar.\n\n' +
@@ -804,34 +836,32 @@ async function sendReceipt(){
             'Vou enviar o comprovante agora.';
   var url = 'https://wa.me/' + WHATSAPP_NUMBER + '?text=' + encodeURIComponent(msg);
 
-  // Tenta criar pending_payment no Firestore — se der erro, segue pro WhatsApp igual
-  if(fbReady && fdb && emailRaw && state.plan && totalNum > 0){
-    try {
-      var payload = {
-        email: emailRaw.toLowerCase(),
-        plan: state.plan,                                    // 'monthly' | 'annual'
-        couponCode: state.coupon ? state.coupon.code : null,
-        couponDiscount: state.coupon ? state.coupon.value : null,
-        priceOriginal: state.price,
-        total: totalNum,
-        createdAt: firebase.firestore.FieldValue.serverTimestamp(),
-        status: 'pending',
-        source: 'assinar-web'
-      };
-      // fire-and-forget com timeout curto pra não travar a UX
-      var racePromise = Promise.race([
-        fdb.collection('pending_payments').add(payload),
-        new Promise(function(_, rej){ setTimeout(function(){ rej(new Error('timeout')); }, 4000); })
-      ]);
-      await racePromise.catch(function(e){
-        console.warn('[assinar] pending_payment não gravado (seguindo mesmo assim):', e);
-      });
-    } catch(e){
-      console.warn('[assinar] Erro criando pending_payment:', e);
-    }
-  }
+  // Tenta gravar no Firestore — se der erro, segue pro WhatsApp igual.
+  await savePendingPaymentToFirestore(totalNum, 'assinar-web-whatsapp');
 
   window.open(url, '_blank');
+  goToSuccess();
+}
+
+// "Já paguei / clique aqui" — cliente fez o Pix mas NÃO quer ir pro WhatsApp.
+// Ainda assim precisa registrar o pagamento pendente pro Caio aprovar.
+async function jaPaguei(){
+  var emailRaw = (document.getElementById('emailField').value || '').trim();
+  if(!emailRaw){
+    alert('Preencha seu e-mail acima antes de confirmar o pagamento.');
+    document.getElementById('emailField').focus();
+    return;
+  }
+  var totalNum = calcTotalNum();
+  var ok = await savePendingPaymentToFirestore(totalNum, 'assinar-web-japaguei');
+  if(!ok){
+    // Firestore falhou (modo privado do navegador, offline, etc).
+    // Não pode mostrar tela de sucesso enganosa — redireciona pro WhatsApp
+    // pra garantir que o Caio saiba do pagamento.
+    alert('Não consegui registrar automaticamente. Vou abrir o WhatsApp pra você me enviar o comprovante direto — assim eu libero sua licença na mão.');
+    sendReceipt();
+    return;
+  }
   goToSuccess();
 }
 
